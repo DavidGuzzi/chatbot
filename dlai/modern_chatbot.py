@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import asyncio
 import os
+import uuid
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -31,6 +32,7 @@ class SQLQuery(BaseModel):
     reasoning: str = Field(description="Why this query answers the question")
     business_context: str = Field(description="Business interpretation of results")
     confidence: float = Field(description="Confidence score 0-1")
+    requires_execution: bool = Field(description="Whether this SQL should be executed", default=True)
 
 class DataInsight(BaseModel):
     """Structured insights from data analysis"""
@@ -45,6 +47,96 @@ class BusinessConcept(BaseModel):
     sql_pattern: str = Field(description="SQL template for this concept")
     required_columns: List[str] = Field(description="Columns needed for this analysis")
     context_keywords: List[str] = Field(description="Related terms and synonyms")
+
+# ============================================================================
+# SESSION MEMORY SYSTEM
+# ============================================================================
+
+@dataclass
+class ConversationTurn:
+    question: str
+    answer: str
+    sql_used: str
+    timestamp: datetime
+    session_id: str
+
+class SessionMemory:
+    """Manages conversation history per session"""
+    
+    def __init__(self, max_turns_per_session: int = 10):
+        self.sessions: Dict[str, List[ConversationTurn]] = {}
+        self.max_turns = max_turns_per_session
+    
+    def add_turn(self, session_id: str, question: str, answer: str, sql_used: str):
+        """Add a conversation turn to the session"""
+        if session_id not in self.sessions:
+            self.sessions[session_id] = []
+        
+        turn = ConversationTurn(
+            question=question,
+            answer=answer,
+            sql_used=sql_used,
+            timestamp=datetime.now(),
+            session_id=session_id
+        )
+        
+        self.sessions[session_id].append(turn)
+        
+        # Keep only the last N turns to manage memory
+        if len(self.sessions[session_id]) > self.max_turns:
+            self.sessions[session_id] = self.sessions[session_id][-self.max_turns:]
+    
+    def get_conversation_context(self, session_id: str) -> str:
+        """Get conversation history for context"""
+        if session_id not in self.sessions or not self.sessions[session_id]:
+            return ""
+        
+        context_parts = ["CONVERSATION HISTORY (Previous questions in this session):"]
+        for i, turn in enumerate(self.sessions[session_id][-5:], 1):  # Last 5 turns
+            context_parts.append(f"Turn {i}:")
+            context_parts.append(f"  User asked: {turn.question}")
+            context_parts.append(f"  Response summary: {turn.answer[:150]}...")
+            context_parts.append(f"  SQL executed: {turn.sql_used}")
+            context_parts.append("")
+        
+        context_parts.append("IMPORTANT: Only reference information that was actually mentioned in previous questions.")
+        return "\n".join(context_parts)
+    
+    def get_related_queries(self, session_id: str) -> List[str]:
+        """Get recent SQL queries for reference"""
+        if session_id not in self.sessions:
+            return []
+        
+        return [turn.sql_used for turn in self.sessions[session_id][-3:]]
+    
+    def validate_follow_up_question(self, session_id: str, question: str) -> Dict[str, Any]:
+        """Validate if a follow-up question can be answered from context"""
+        if session_id not in self.sessions or not self.sessions[session_id]:
+            return {"valid": True, "message": ""}
+        
+        # Keywords that indicate follow-up questions
+        follow_up_keywords = [
+            "anteriormente", "mencioné", "mencionaste", "dijiste", 
+            "esa", "ese", "esos", "esas", "aquella", "aquel",
+            "la anterior", "el anterior", "antes", "previamente"
+        ]
+        
+        question_lower = question.lower()
+        is_follow_up = any(keyword in question_lower for keyword in follow_up_keywords)
+        
+        if is_follow_up:
+            # Get what was actually mentioned in previous questions
+            previous_questions = [turn.question.lower() for turn in self.sessions[session_id]]
+            context_summary = " ".join(previous_questions)
+            
+            return {
+                "valid": True,
+                "is_follow_up": True,
+                "context_available": context_summary,
+                "message": f"Follow-up question detected. Previous context: {context_summary[:200]}..."
+            }
+        
+        return {"valid": True, "is_follow_up": False, "message": ""}
 
 # ============================================================================
 # SEMANTIC CACHE SYSTEM
@@ -108,10 +200,12 @@ class SemanticCache:
 # ============================================================================
 
 class BusinessIntelligence:
-    """Maps business concepts to SQL patterns"""
+    """Maps business concepts to SQL patterns using both keywords and embeddings"""
     
     def __init__(self):
         self.concepts = self._initialize_business_concepts()
+        self.model = SentenceTransformer('all-MiniLM-L6-v2')
+        self._initialize_concept_embeddings()
     
     def _initialize_business_concepts(self) -> List[BusinessConcept]:
         """Define business concepts for the retail experiment domain"""
@@ -142,14 +236,42 @@ class BusinessIntelligence:
             )
         ]
     
+    def _initialize_concept_embeddings(self):
+        """Pre-compute embeddings for business concepts"""
+        self.concept_embeddings = {}
+        for concept in self.concepts:
+            # Combine natural term and keywords for richer embedding
+            concept_text = f"{concept.natural_term} {' '.join(concept.context_keywords)}"
+            embedding = self.model.encode([concept_text])[0]
+            self.concept_embeddings[concept.natural_term] = embedding
+    
     def find_relevant_concept(self, query: str) -> Optional[BusinessConcept]:
-        """Find the most relevant business concept for a query"""
+        """Find the most relevant business concept using hybrid approach: keywords + embeddings"""
         query_lower = query.lower()
         
+        # Method 1: Exact keyword matching (fast and precise)
         for concept in self.concepts:
             if any(keyword in query_lower for keyword in concept.context_keywords):
                 return concept
-        return None
+        
+        # Method 2: Semantic similarity using embeddings (catches similar concepts)
+        query_embedding = self.model.encode([query])[0]
+        
+        best_concept = None
+        best_similarity = 0.0
+        similarity_threshold = 0.6  # Lower threshold for concept matching
+        
+        for concept in self.concepts:
+            concept_embedding = self.concept_embeddings[concept.natural_term]
+            similarity = np.dot(query_embedding, concept_embedding) / (
+                np.linalg.norm(query_embedding) * np.linalg.norm(concept_embedding)
+            )
+            
+            if similarity > best_similarity and similarity > similarity_threshold:
+                best_similarity = similarity
+                best_concept = concept
+        
+        return best_concept
 
 # ============================================================================
 # MODERN CHATBOT ENGINE
@@ -172,6 +294,7 @@ class ModernDataChatbot:
         self.db = duckdb.connect(':memory:')
         self.cache = SemanticCache(self.config.get('similarity_threshold'))
         self.bi = BusinessIntelligence()
+        self.memory = SessionMemory(max_turns_per_session=self.config.get('max_memory_turns', 10))
         
         # Set OpenAI API key from .env or kwargs
         openai.api_key = self.config.get('openai_api_key') or os.getenv('OPENAI_API_KEY')
@@ -198,6 +321,7 @@ class ModernDataChatbot:
             # Performance Configuration
             'query_timeout': kwargs.get('query_timeout') or int(os.getenv('QUERY_TIMEOUT_SECONDS', '30')),
             'debug': kwargs.get('debug') or os.getenv('DEBUG', 'false').lower() == 'true',
+            'max_memory_turns': kwargs.get('max_memory_turns') or int(os.getenv('MAX_MEMORY_TURNS', '10')),
         }
         
         if config['debug']:
@@ -293,7 +417,7 @@ class ModernDataChatbot:
         }
         return schema
     
-    def _generate_sql_with_structured_output(self, question: str, context: str = "") -> SQLQuery:
+    def _generate_sql_with_structured_output(self, question: str, context: str = "", session_id: str = None) -> SQLQuery:
         """Generate SQL using structured outputs - no dynamic code execution"""
         
         # Build comprehensive context with all tables
@@ -330,11 +454,30 @@ class ModernDataChatbot:
             Required Columns: {relevant_concept.required_columns}
             """
         
+        # Add conversation context if session_id provided
+        conversation_context = ""
+        follow_up_instruction = ""
+        if session_id:
+            conversation_context = self.memory.get_conversation_context(session_id)
+            validation = self.memory.validate_follow_up_question(session_id, question)
+            if validation.get("is_follow_up", False):
+                follow_up_instruction = f"""
+                FOLLOW-UP QUESTION DETECTED:
+                The user is referencing something from previous conversation. 
+                Previous context: {validation.get('context_available', '')[:300]}
+                
+                CRITICAL: Only answer based on what was ACTUALLY mentioned in previous questions.
+                If the user asks about something NOT mentioned before, state clearly:
+                "En la conversación anterior no mencionaste [tema]. Las preguntas anteriores fueron sobre [resumen real]."
+                """
+        
         prompt = f"""
         You are a SQL expert for business analytics. Generate a SQL query to answer the question.
         
         {schema_context}
         {concept_context}
+        {conversation_context}
+        {follow_up_instruction}
         {context}
         
         QUESTION: {question}
@@ -347,6 +490,18 @@ class ModernDataChatbot:
         - Use proper aggregations and filters
         - Limit results to most relevant (TOP 10 unless specified)
         - Example JOIN: SELECT t.*, m.nombre_tienda FROM tiendas t JOIN maestro_tiendas m ON t.tienda_id = m.tienda_id
+        
+        CONVERSATION CONTEXT RULES:
+        - If this is a follow-up question (contains "anteriormente", "mencioné", "esa", "ese", "esos", etc.), carefully check the conversation history
+        - If the user asks about something NOT mentioned in previous questions, you MUST respond with:
+          * reasoning: "El usuario pregunta sobre [tema] que no fue mencionado en conversaciones anteriores."
+          * business_context: "No puedo responder esta pregunta porque se refiere a información que no fue discutida previamente."
+          * sql: "SELECT 'No hay información previa sobre este tema' as mensaje;"
+          * confidence: 0.1
+          * requires_execution: false
+        - For meta-questions about the conversation itself (like "¿qué te pregunté primero?"), set requires_execution: false
+        - Only build upon previous results if they are logically connected
+        - DO NOT generate new analysis for topics not previously discussed in follow-up questions
         
         Return a structured response with SQL, reasoning, business context, and confidence.
         """
@@ -428,11 +583,20 @@ class ModernDataChatbot:
                 related_questions=[]
             )
     
-    async def ask(self, question: str) -> Dict[str, Any]:
+    async def ask(self, question: str, session_id: str = None) -> Dict[str, Any]:
         """
         Main chat interface with full hybrid approach
         """
         start_time = datetime.now()
+        
+        # Generate session ID if not provided
+        if session_id is None:
+            session_id = str(uuid.uuid4())
+        
+        # 0. Validate follow-up questions
+        validation = self.memory.validate_follow_up_question(session_id, question)
+        if validation.get("is_follow_up", False) and self.config.get('debug'):
+            print(f"🔍 Follow-up detected: {validation['message']}")
         
         # 1. Check semantic cache first
         cached_result = self.cache.get_similar_query(question)
@@ -449,10 +613,14 @@ class ModernDataChatbot:
             }
         
         # 2. Generate SQL with structured output
-        sql_query = self._generate_sql_with_structured_output(question)
+        sql_query = self._generate_sql_with_structured_output(question, session_id=session_id)
         
-        # 3. Execute query in DuckDB
-        results = self._execute_query(sql_query.sql)
+        # 3. Execute query in DuckDB (only if required)
+        if sql_query.requires_execution:
+            results = self._execute_query(sql_query.sql)
+        else:
+            # For meta-questions or context errors, don't execute SQL
+            results = [{"message": "No SQL execution required", "type": "meta_response"}]
         
         # 4. Generate business insights
         insights = self._generate_insights(question, results)
@@ -469,6 +637,7 @@ class ModernDataChatbot:
                 "related_questions": insights.related_questions
             },
             "sql_used": sql_query.sql,
+            "sql_executed": sql_query.requires_execution,
             "reasoning": sql_query.reasoning,
             "confidence": sql_query.confidence,
             "cached": False,
@@ -477,6 +646,12 @@ class ModernDataChatbot:
         
         # 6. Store in semantic cache
         self.cache.store_query(question, sql_query.sql, response)
+        
+        # 7. Store in session memory
+        self.memory.add_turn(session_id, question, response["answer"], sql_query.sql)
+        
+        # 8. Add session ID to response
+        response["session_id"] = session_id
         
         return response
     
@@ -490,51 +665,108 @@ class ModernDataChatbot:
             "total_cache_hits": total_hits,
             "cache_hit_rate": total_hits / max(1, total_entries + total_hits) * 100
         }
+    
+    def get_session_stats(self) -> Dict[str, Any]:
+        """Get session memory statistics"""
+        total_sessions = len(self.memory.sessions)
+        total_turns = sum(len(turns) for turns in self.memory.sessions.values())
+        
+        return {
+            "active_sessions": total_sessions,
+            "total_conversation_turns": total_turns,
+            "avg_turns_per_session": total_turns / max(1, total_sessions)
+        }
+    
+    def get_session_history(self, session_id: str) -> List[Dict[str, Any]]:
+        """Get conversation history for a session"""
+        if session_id not in self.memory.sessions:
+            return []
+        
+        return [
+            {
+                "question": turn.question,
+                "answer": turn.answer,
+                "sql_used": turn.sql_used,
+                "timestamp": turn.timestamp.isoformat()
+            }
+            for turn in self.memory.sessions[session_id]
+        ]
 
 # ============================================================================
 # EXAMPLE USAGE AND TESTING
 # ============================================================================
 
 async def main():
-    """Example usage of the modern chatbot"""
+    """Example usage of the modern chatbot with session memory"""
     
     # Initialize chatbot
     chatbot = ModernDataChatbot("tiendas_detalle.csv")
     
-    # Test questions
-    test_questions = [
+    print("🤖 Modern Hybrid Chatbot with Session Memory - Testing\n")
+    
+    # Test conversational flow with session memory
+    session_id = "demo_session_001"
+    
+    conversation_flow = [
         "¿Cuál es el performance por región en términos de revenue?",
-        "¿Qué tipo de tienda tiene mejor conversión?",
-        "¿Cuál es el impacto del experimento A/B?",
-        "¿Cuáles son las top 5 tiendas con mejor conversion rate?",
-        "¿Hay diferencias significativas entre Control y Test?",
+        "¿Y cuál región tiene mejor conversión?",  # Follow-up question
+        "Muéstrame las top 5 tiendas de esa región",  # Another follow-up
+        "¿Qué tipos de tienda son estas?",  # Continues the thread
+        "Ahora muéstrame el impacto del experimento A/B en esas tiendas",  # Complex follow-up
     ]
     
-    print("🤖 Modern Hybrid Chatbot - Testing\n")
+    print(f"📋 **Conversación en sesión:** {session_id}\n")
     
-    for question in test_questions:
-        print(f"❓ **Pregunta:** {question}")
+    for i, question in enumerate(conversation_flow, 1):
+        print(f"❓ **Pregunta {i}:** {question}")
         
-        response = await chatbot.ask(question)
+        response = await chatbot.ask(question, session_id=session_id)
         
         print(f"✅ **Respuesta:** {response['answer']}")
         print(f"📊 **SQL usado:** `{response['sql_used']}`")
         print(f"⚡ **Tiempo:** {response['execution_time']:.2f}s")
         print(f"💾 **Cached:** {'Sí' if response['cached'] else 'No'}")
+        print(f"🆔 **Session ID:** {response['session_id']}")
         
-        if response['insights']['recommendations']:
-            print(f"💡 **Recomendaciones:**")
-            for rec in response['insights']['recommendations']:
-                print(f"   - {rec}")
+        if response['insights']['related_questions']:
+            print(f"🔍 **Preguntas relacionadas:**")
+            for related in response['insights']['related_questions'][:2]:
+                print(f"   - {related}")
         
         print("-" * 80)
     
-    # Show cache performance
+    # Test semantic concept matching with embeddings
+    print("\n🧠 **Prueba de Embeddings - Conceptos Similares:**")
+    
+    semantic_test_questions = [
+        "rendimiento de las tiendas por zona geográfica",  # Similar to "performance por región"
+        "mejores formatos de local",  # Similar to "mejor tipo de tienda" 
+        "resultados del test A/B",  # Similar to "impacto del experimento"
+    ]
+    
+    for question in semantic_test_questions:
+        print(f"❓ **Pregunta semántica:** {question}")
+        response = await chatbot.ask(question, session_id="semantic_test")
+        print(f"✅ **Concepto detectado:** {chatbot.bi.find_relevant_concept(question)}")
+        print(f"📊 **SQL generado:** `{response['sql_used'][:100]}...`")
+        print("-" * 50)
+    
+    # Show performance statistics
     cache_stats = chatbot.get_cache_stats()
-    print(f"\n📈 **Cache Performance:**")
-    print(f"   - Queries cached: {cache_stats['total_cached_queries']}")
-    print(f"   - Cache hits: {cache_stats['total_cache_hits']}")
-    print(f"   - Hit rate: {cache_stats['cache_hit_rate']:.1f}%")
+    session_stats = chatbot.get_session_stats()
+    
+    print(f"\n📈 **Estadísticas de Rendimiento:**")
+    print(f"   📚 **Cache:** {cache_stats['total_cached_queries']} queries, {cache_stats['cache_hit_rate']:.1f}% hit rate")
+    print(f"   💭 **Sesiones:** {session_stats['active_sessions']} activas, {session_stats['avg_turns_per_session']:.1f} turnos promedio")
+    
+    # Show conversation history
+    history = chatbot.get_session_history(session_id)
+    print(f"\n📝 **Historial de Conversación (Sesión: {session_id}):**")
+    for i, turn in enumerate(history[-3:], 1):  # Last 3 turns
+        print(f"   {i}. Q: {turn['question'][:50]}...")
+        print(f"      A: {turn['answer'][:50]}...")
+        print(f"      SQL: {turn['sql_used'][:50]}...")
+        print()
 
 if __name__ == "__main__":
     # Run the async example
