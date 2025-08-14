@@ -1,0 +1,42 @@
+# Development docker-compose with hot reload and easier debugging
+services:
+  # Backend in development mode
+  backend-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: gatorade-backend-dev
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=development
+      - FLASK_DEBUG=1
+      - PYTHONPATH=/app
+      - DEBUG=true
+    volumes:
+      - .:/app
+    networks:
+      - gatorade-network
+    command: python backend/app.py
+
+  # Frontend in development mode with hot reload
+  frontend-dev:
+    image: node:18-alpine
+    container_name: gatorade-frontend-dev
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    depends_on:
+      - backend-dev
+    networks:
+      - gatorade-network
+    environment:
+      - VITE_API_URL=http://localhost:5000
+
+networks:
+  gatorade-network:
+    driver: bridge

@@ -1,0 +1,16 @@
+# Flask Backend Requirements
+# Extends the main chatbot requirements with web server dependencies
+
+# Web Framework
+Flask>=3.0.0
+Flask-CORS>=4.0.0
+
+# Async Support for Flask
+asgiref>=3.7.0
+
+# Development and Production
+gunicorn>=21.0.0              # Production WSGI server
+python-dotenv>=1.0.0          # Environment variables
+
+# Import all chatbot dependencies
+-r requirements-base.txt

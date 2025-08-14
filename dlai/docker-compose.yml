@@ -1,0 +1,72 @@
+services:
+  # Backend service
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: gatorade-backend
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=development
+      - PYTHONPATH=/app
+    volumes:
+      - .:/app
+      - ./tiendas_detalle.csv:/app/tiendas_detalle.csv
+      - ./maestro_tiendas.csv:/app/maestro_tiendas.csv
+      - ./.env:/app/.env
+    networks:
+      - gatorade-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Frontend service  
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: gatorade-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - gatorade-network
+    environment:
+      - REACT_APP_API_URL=http://localhost:5000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # Development frontend (for hot reload)
+  frontend-dev:
+    image: node:18-alpine
+    container_name: gatorade-frontend-dev
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    ports:
+      - "5173:5173"
+    command: sh -c "npm install && npm run dev -- --host"
+    depends_on:
+      - backend
+    networks:
+      - gatorade-network
+    environment:
+      - VITE_API_URL=http://localhost:5000
+    profiles:
+      - dev
+
+networks:
+  gatorade-network:
+    driver: bridge
+
+volumes:
+  node_modules:
